@@ -32,15 +32,33 @@ jobs:
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/glslang/install" \
             -DENABLE_GLSLANG_BINARIES=ON \
             -DENABLE_HLSL=OFF \
             -DENABLE_OPT=OFF \
             -DGLSLANG_TESTS=OFF \
             -DENABLE_SPVREMAPPER=OFF
 
-      - name: Build glslangValidator
+      - name: Build glslang
         working-directory: glslang
-        run: cmake --build build --target glslangValidator -j"$(nproc)"
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Install glslang binaries
+        working-directory: glslang
+        run: cmake --install build
+
+      - name: Locate the standalone compiler binary
+        shell: bash
+        run: |
+          BIN="$(find "${{ github.workspace }}/glslang/install" "${{ github.workspace }}/glslang/build" \
+            -maxdepth 6 -type f \( -name glslang -o -name glslangValidator \) -perm -u+x | head -n1)"
+          if [ -z "$BIN" ]; then
+            echo "Could not locate glslang/glslangValidator binary. Build output tree:" >&2
+            find "${{ github.workspace }}/glslang" -maxdepth 6 -type f -perm -u+x >&2
+            exit 1
+          fi
+          echo "Found compiler binary at: $BIN"
+          echo "GLSLANG_BIN=$BIN" >> "$GITHUB_ENV"
 
       - name: Compile shaders to SPIR-V
         shell: bash
@@ -53,7 +71,7 @@ jobs:
             echo "Compiling $f"
             OUT="compiled-spv/$f.spv"
             mkdir -p "$(dirname "$OUT")"
-            ./glslang/build/StandAlone/glslangValidator -V "$f" -o "$OUT"
+            "$GLSLANG_BIN" -V "$f" -o "$OUT"
           done
           if [ "$FOUND" -eq 0 ]; then
             echo "No .frag files matched: ${{ github.event.inputs.frag_glob }}" >&2
