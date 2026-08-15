@@ -1,0 +1,67 @@
+name: Compile Shader
+
+on:
+  workflow_dispatch:
+    inputs:
+      frag_glob:
+        description: 'Glob pattern matching .frag files in this repo'
+        required: true
+        default: 'src/shader/*.frag'
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v7
+
+      - name: Checkout glslang @ fc9889c
+        uses: actions/checkout@v7
+        with:
+          repository: KhronosGroup/glslang
+          ref: fc9889c
+          path: glslang
+
+      - name: Fetch glslang build dependencies
+        working-directory: glslang
+        run: |
+          python3 update_glslang_sources.py
+
+      - name: Configure glslang
+        working-directory: glslang
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_GLSLANG_BINARIES=ON \
+            -DENABLE_HLSL=OFF \
+            -DENABLE_OPT=OFF \
+            -DGLSLANG_TESTS=OFF \
+            -DENABLE_SPVREMAPPER=OFF
+
+      - name: Build glslangValidator
+        working-directory: glslang
+        run: cmake --build build --target glslangValidator -j"$(nproc)"
+
+      - name: Compile shaders to SPIR-V
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          mkdir -p compiled-spv
+          FOUND=0
+          for f in ${{ github.event.inputs.frag_glob }}; do
+            FOUND=1
+            echo "Compiling $f"
+            OUT="compiled-spv/$f.spv"
+            mkdir -p "$(dirname "$OUT")"
+            ./glslang/build/StandAlone/glslangValidator -V "$f" -o "$OUT"
+          done
+          if [ "$FOUND" -eq 0 ]; then
+            echo "No .frag files matched: ${{ github.event.inputs.frag_glob }}" >&2
+            exit 1
+          fi
+
+      - name: Upload compiled SPIR-V
+        uses: actions/upload-artifact@v7
+        with:
+          name: compiled-spv
+          path: compiled-spv/
