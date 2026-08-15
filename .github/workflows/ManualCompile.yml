@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           repository: KhronosGroup/glslang
-          ref: fc9889c
+          ref: fc9889c889561c5882e83819dcaffef5ed45529b
           path: glslang
 
       - name: Fetch glslang build dependencies
