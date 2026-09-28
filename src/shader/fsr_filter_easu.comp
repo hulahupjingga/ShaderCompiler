@@ -37,7 +37,7 @@ uvec4 con3;
 #define A_GLSL 1
 
 #define A_HALF
-#include "../../../external/GPUOpen/ffx_a.h"
+#include "external/GPUOpen/ffx_a.h"
 layout(set=0,binding=1) uniform texture2D InputTexture;
 layout(set=0,binding=2,rgba8) uniform image2D OutputTexture;
 layout(set=0,binding=3) uniform sampler InputSampler;
@@ -46,7 +46,7 @@ AH4 FsrEasuRH(AF2 p) { AH4 res = AH4(textureGather(sampler2D(InputTexture,InputS
 AH4 FsrEasuGH(AF2 p) { AH4 res = AH4(textureGather(sampler2D(InputTexture,InputSampler), p, 1)); return res; }
 AH4 FsrEasuBH(AF2 p) { AH4 res = AH4(textureGather(sampler2D(InputTexture,InputSampler), p, 2)); return res; }	
 
-#include "../../../external/GPUOpen/ffx_fsr1.h"
+#include "external/GPUOpen/ffx_fsr1.h"
 
 void CurrFilter(AU2 pos)
 {
