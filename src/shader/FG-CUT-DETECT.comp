@@ -1,0 +1,128 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+//
+// Frame generation: scene-cut / instant-menu detection, and the parameter blocks of the Gen pass.
+//
+// One workgroup (dispatch 1,1,1), run after the current frame has been ingested and before the Gen pass.
+//   1. Compares a coarse luminance level of the previous and the current real frame on a 16x16 grid.
+//   2. If the pair looks like a cut (or the previous pair did: one frame of hold-off, because the flow passes
+//      also read the frame before), every generated frame of this pair is made a plain copy of the previous
+//      real frame by writing the interpolation time t = 0 into its Gen parameter block. In the compiled Gen
+//      shader t = 0 gives the previous frame unwarped: weights (1 - t) / t, displacements 2t / 2(1 - t).
+//   3. Otherwise it writes the planned time of each generated frame.
+//
+// Why a shader writes the Gen parameters: the Gen pass reads its time from a uniform buffer, and the decision
+// depends on the images, which only the GPU has. Writing the block here needs no CPU read-back and no stall.
+//
+// Contract with the host (descriptor set 0, own pipeline layout, 40 bytes of push constants):
+//   binding 0  STORAGE_BUFFER          "Live": one 256-byte block per generated frame (k = 0..3), at byte
+//                                      offset k * 256, holds the Gen parameter block {1/flow, t, 0.5, 0}.
+//                                      The Gen descriptor set of output k binds this buffer as a UNIFORM_BUFFER
+//                                      with offset k * 256, range 16. 256 is always a valid uniform offset.
+//                                      Block 4 (byte offset 1024) is state and telemetry, see below.
+//   binding 1  COMBINED_IMAGE_SAMPLER  previous real frame, one R8 level of the pyramid (level 3 suggested)
+//   binding 2  COMBINED_IMAGE_SAMPLER  current real frame, same level
+//
+// State and telemetry block (words[64], read back by the host only for display and tuning):
+//   .x  hold-off frames left (persists between frames, owned by this shader)
+//   .y  mean absolute difference of the last pair (float bits)
+//   .z  fraction of grid samples with a large difference (float bits)
+//   .w  1 if the last pair was classified as a cut, else 0
+//
+// The host must make the Live buffer's compute writes visible to the Gen pass (uniform read) and to this
+// shader's next run (the hold-off state), and must zero-initialise the buffer once.
+//
+// The three thresholds are push constants so they can be tuned without recompiling. The starting values
+// (cut_mean 0.12, cut_frac 0.30, cut_pix 0.15) are guesses, not measurements: calibrate them with the
+// telemetry words, normal gameplay against the menus that go wrong.
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer Live {
+    uvec4 words[];
+} live;
+
+layout(set = 0, binding = 1) uniform sampler2D prev_luma;
+layout(set = 0, binding = 2) uniform sampler2D cur_luma;
+
+layout(push_constant) uniform Params {
+    vec4  t;         // interpolation time of generated frame k, in 0..1 (only the first `count` are used)
+    float inv_flow;  // 1 / min(flow scale, 1): member 0 of the Gen parameter block
+    float cut_mean;  // mean |difference| above which the pair is a cut
+    float cut_frac;  // fraction of samples above cut_pix above which the pair is a cut
+    float cut_pix;   // per-sample |difference| that counts as changed
+    uint  count;     // generated frames for this pair, 0..4
+} pc;
+
+const uint GRID = 16u;
+const uint SAMPLES = GRID * GRID;
+const uint BLOCK_WORDS = 16u;     // one 256-byte block = 16 uvec4
+const uint STATE_BLOCK = 4u;      // block index of the state / telemetry words
+
+shared float sh_sum[SAMPLES];
+shared float sh_changed[SAMPLES];
+
+void main() {
+    const uint index = gl_LocalInvocationIndex;
+
+    // --- one sample per thread on a regular grid, independent of the level size
+    const ivec2 size_prev = textureSize(prev_luma, 0);
+    const ivec2 size_cur = textureSize(cur_luma, 0);
+    const vec2 uv = (vec2(gl_LocalInvocationID.xy) + 0.5) / float(GRID);
+    const ivec2 p_prev = min(ivec2(uv * vec2(size_prev)), size_prev - 1);
+    const ivec2 p_cur = min(ivec2(uv * vec2(size_cur)), size_cur - 1);
+    const float diff = abs(texelFetch(prev_luma, p_prev, 0).r - texelFetch(cur_luma, p_cur, 0).r);
+
+    sh_sum[index] = diff;
+    sh_changed[index] = diff > pc.cut_pix ? 1.0 : 0.0;
+    memoryBarrierShared();
+    barrier();
+
+    // --- tree reduction over the 256 samples
+    for (uint stride = SAMPLES / 2u; stride > 0u; stride >>= 1u) {
+        if (index < stride) {
+            sh_sum[index] += sh_sum[index + stride];
+            sh_changed[index] += sh_changed[index + stride];
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+
+    if (index != 0u) {
+        return;
+    }
+
+    const float mean_diff = sh_sum[0] / float(SAMPLES);
+    const float changed_fraction = sh_changed[0] / float(SAMPLES);
+    const bool cut_now = mean_diff > pc.cut_mean || changed_fraction > pc.cut_frac;
+
+    // --- hold-off: after a cut the flow passes still read the frame before it, so the next pair is not
+    //     interpolated either
+    const uint state_index = STATE_BLOCK * BLOCK_WORDS;
+    const uint holdoff = live.words[state_index].x;
+    const bool passthrough = cut_now || holdoff > 0u;
+
+    uint holdoff_next = 0u;
+    if (cut_now) {
+        holdoff_next = 1u;
+    } else if (holdoff > 0u) {
+        holdoff_next = holdoff - 1u;
+    }
+
+    // --- Gen parameter blocks {1/flow, t, 0.5, 0}; t = 0 turns the Gen pass into a copy of the previous frame
+    const uint count = min(pc.count, 4u);
+    for (uint k = 0u; k < count; ++k) {
+        const float t = passthrough ? 0.0 : pc.t[k];
+        live.words[k * BLOCK_WORDS] = uvec4(
+            floatBitsToUint(pc.inv_flow),
+            floatBitsToUint(t),
+            floatBitsToUint(0.5),
+            0u);
+    }
+
+    live.words[state_index] = uvec4(
+        holdoff_next,
+        floatBitsToUint(mean_diff),
+        floatBitsToUint(changed_fraction),
+        cut_now ? 1u : 0u);
+}
