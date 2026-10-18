@@ -1,0 +1,148 @@
+name: Compile Compute Shader
+
+# Compiles compute shaders (.comp) to SPIR-V with a pinned glslang, validates them, and uploads
+#   - the .spv binaries,
+#   - a disassembly (.spvasm) of each, to read what was produced,
+#   - the shader as an array in the format of framegen_shaders.h (.inc).
+# No --target-env is passed on purpose: glslang then emits SPIR-V 1.0 (Vulkan 1.0), the same version word
+# (0x00010000) as the frame generation shaders already in the engine.
+
+on:
+  workflow_dispatch:
+    inputs:
+      comp_glob:
+        description: 'Glob pattern matching .comp files in this repo'
+        required: true
+        default: 'src/shader/*.comp'
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v7
+
+      - name: Checkout glslang @ fc9889c
+        uses: actions/checkout@v7
+        with:
+          repository: KhronosGroup/glslang
+          ref: fc9889c889561c5882e83819dcaffef5ed45529b
+          path: glslang
+
+      - name: Fetch glslang build dependencies
+        working-directory: glslang
+        run: |
+          python3 update_glslang_sources.py
+
+      - name: Configure glslang
+        working-directory: glslang
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/glslang/install" \
+            -DENABLE_GLSLANG_BINARIES=ON \
+            -DENABLE_HLSL=OFF \
+            -DENABLE_OPT=OFF \
+            -DGLSLANG_TESTS=OFF \
+            -DENABLE_SPVREMAPPER=OFF
+
+      - name: Build glslang
+        working-directory: glslang
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Install glslang binaries
+        working-directory: glslang
+        run: cmake --install build
+
+      - name: Locate the standalone compiler binary
+        shell: bash
+        run: |
+          BIN="$(find "${{ github.workspace }}/glslang/install" "${{ github.workspace }}/glslang/build" \
+            -maxdepth 6 -type f \( -name glslang -o -name glslangValidator \) -perm -u+x | head -n1)"
+          if [ -z "$BIN" ]; then
+            echo "Could not locate glslang/glslangValidator binary. Build output tree:" >&2
+            find "${{ github.workspace }}/glslang" -maxdepth 6 -type f -perm -u+x >&2
+            exit 1
+          fi
+          echo "Found compiler binary at: $BIN"
+          echo "GLSLANG_BIN=$BIN" >> "$GITHUB_ENV"
+
+      - name: Install SPIRV-Tools (validator and disassembler)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y spirv-tools
+          spirv-val --version
+
+      - name: Compile shaders to SPIR-V
+        shell: bash
+        env:
+          COMP_GLOB: ${{ inputs.comp_glob }}
+        run: |
+          shopt -s globstar nullglob
+          mkdir -p compiled-spv
+          FOUND=0
+          for f in $COMP_GLOB; do
+            FOUND=1
+            echo "Compiling $f"
+            OUT="compiled-spv/$f.spv"
+            mkdir -p "$(dirname "$OUT")"
+            "$GLSLANG_BIN" -V "$f" -o "$OUT"
+          done
+          if [ "$FOUND" -eq 0 ]; then
+            echo "No .comp files matched: $COMP_GLOB" >&2
+            exit 1
+          fi
+
+      - name: Validate SPIR-V and write disassembly
+        shell: bash
+        run: |
+          # glslang above is built without SPIRV-Tools (ENABLE_OPT=OFF), so validation happens here.
+          # vulkan1.0 matches the SPIR-V 1.0 modules produced above.
+          while IFS= read -r -d '' spv; do
+            echo "Validating $spv"
+            spirv-val --target-env vulkan1.0 "$spv"
+            spirv-dis "$spv" -o "${spv%.spv}.spvasm"
+          done < <(find compiled-spv -type f -name '*.spv' -print0)
+
+      - name: Write framegen_shaders.h style arrays
+        shell: bash
+        run: |
+          mkdir -p compiled-spv/inc
+          while IFS= read -r -d '' spv; do
+            base="$(basename "$spv" .spv)"
+            python3 - "$spv" "compiled-spv/inc/${base}.inc" <<'PY'
+          import pathlib
+          import re
+          import struct
+          import sys
+
+          src = pathlib.Path(sys.argv[1])
+          out = pathlib.Path(sys.argv[2])
+          data = src.read_bytes()
+          if len(data) % 4 or struct.unpack("<I", data[:4])[0] != 0x07230203:
+              sys.exit(f"{src}: not a little-endian SPIR-V module")
+          words = struct.unpack(f"<{len(data) // 4}I", data)
+
+          # fg_cut_detect.comp.spv -> ShaderFgCutDetect
+          stem = src.name.split(".")[0]
+          name = "Shader" + "".join(p.capitalize() for p in re.split(r"[^0-9A-Za-z]+", stem) if p)
+
+          lines = []
+          for i in range(0, len(words), 12):
+              lines.append(",".join(f"0x{w:08x}" for w in words[i:i + 12]) + ",")
+          out.write_text(
+              f"// {stem} ({len(data)} bytes)\n"
+              f"inline constexpr u32 {name}[] = {{\n" + "\n".join(lines) + "\n};\n"
+          )
+          print(f"{src} -> {out} ({name}, {len(words)} words)")
+          PY
+          done < <(find compiled-spv -type f -name '*.spv' -print0)
+
+      - name: Upload compiled SPIR-V
+        uses: actions/upload-artifact@v7
+        with:
+          name: compiled-spv
+          path: compiled-spv/
